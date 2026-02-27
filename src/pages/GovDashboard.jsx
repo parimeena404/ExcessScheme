@@ -1,17 +1,26 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import StatusBadge from '../components/StatusBadge'
 import ThemeToggle from '../components/ThemeToggle'
 import { SCHEMES, APPLICATIONS, AI_FLAGS, TX_DATA, MINTED_HISTORY, REPORTS_DATA } from '../data/dashboardData'
+import {
+  makePeraSigner,
+  markMilestoneComplete,
+  releasePayout as contractReleasePayout,
+  getGlobalState,
+  getStudentState,
+  APP_ID,
+} from '../lib/scholarship-contract'
+import { loadAddress } from '../lib/perawallet'
 
 const TABS = [
-  { id:'overview',    icon:'📊', label:'Overview' },
-  { id:'schemes',     icon:'🏛️', label:'Manage Schemes' },
-  { id:'tokenize',    icon:'🔗', label:'Tokenize Funds' },
-  { id:'applications',icon:'📝', label:'Applications', badge: 3 },
-  { id:'flags',       icon:'🚨', label:'AI Flags', badge: 7 },
-  { id:'reports',     icon:'📄', label:'Audit Reports' },
+  { id:'overview',     icon:'📊', label:'Overview' },
+  { id:'schemes',      icon:'🏛️', label:'Manage Schemes' },
+  { id:'blockchain',   icon:'⛓️', label:'Blockchain Ops' },
+  { id:'applications', icon:'📝', label:'Applications', badge: 3 },
+  { id:'flags',        icon:'🚨', label:'AI Flags', badge: 7 },
+  { id:'reports',      icon:'📄', label:'Audit Reports' },
 ]
 
 function BarChart() {
@@ -19,11 +28,11 @@ function BarChart() {
   useEffect(() => {
     const c = canvasRef.current; if (!c) return
     const ctx = c.getContext('2d')
-    const data = [42, 68, 55, 80, 63, 75, 90]
+    const data = [17, 36, 49, 64, 39, 77, 83]
     const labels = ['Aug','Sep','Oct','Nov','Dec','Jan','Feb']
     const th = document.documentElement.getAttribute('data-theme')
-    const barColor = th === 'light' ? '#009E88' : '#00E8C6'
-    const textColor = th === 'light' ? '#3D6458' : '#94A3B8'
+    const barColor = th === 'light' ? '#4F46E5' : '#818CF8'
+    const textColor = th === 'light' ? '#475569' : '#94A3B8'
     c.width = c.offsetWidth; c.height = c.offsetHeight || 180
     ctx.clearRect(0, 0, c.width, c.height)
     const pad = 30, bw = Math.floor((c.width - pad * 2) / data.length) - 8
@@ -60,13 +69,13 @@ function DonutChart({ value = 73 }) {
     ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.strokeStyle='rgba(255,255,255,.06)'; ctx.lineWidth=14; ctx.stroke()
     const start = -Math.PI/2, end = start + (value/100)*Math.PI*2
     const grad = ctx.createLinearGradient(0,0,c.width,c.height)
-    grad.addColorStop(0, th==='light'?'#009E88':'#00E8C6')
-    grad.addColorStop(1, '#00A8FF')
+    grad.addColorStop(0, th==='light'?'#4F46E5':'#818CF8')
+    grad.addColorStop(1, '#38BDF8')
     ctx.beginPath(); ctx.arc(cx,cy,r,start,end); ctx.strokeStyle=grad; ctx.lineWidth=14; ctx.lineCap='round'; ctx.stroke()
-    ctx.fillStyle = th==='light'?'#0F2820':'#fff'
+    ctx.fillStyle = th==='light'?'#0F172A':'#fff'
     ctx.font = 'bold 22px Inter'; ctx.textAlign='center'; ctx.textBaseline='middle'
     ctx.fillText(value+'%', cx, cy-6)
-    ctx.fillStyle = th==='light'?'#3D6458':'#94A3B8'
+    ctx.fillStyle = th==='light'?'#475569':'#94A3B8'
     ctx.font = '11px Inter'; ctx.fillText('Utilized',cx,cy+14)
   }, [value])
   return <canvas ref={canvasRef} style={{ width:'160px', height:'160px', display:'block', margin:'0 auto' }} />
@@ -82,7 +91,76 @@ export default function GovDashboard() {
   const [apps, setApps] = useState(APPLICATIONS)
   const [flags, setFlags] = useState(AI_FLAGS)
   const [showCreateScheme, setShowCreateScheme] = useState(false)
+
+  // ── Contract state ──────────────────────────────────
+  const [contractGlobal,  setContractGlobal]  = useState(null)
+  const [contractLoading, setContractLoading] = useState(false)
+  const [contractError,   setContractError]   = useState(null)
+  const [contractTx,      setContractTx]      = useState(null)
+  const [contractAction,  setContractAction]  = useState(null)
+  const [studentTarget,   setStudentTarget]   = useState('')
+  const [studentState,    setStudentState]    = useState(null)
+
+  const loadGlobal = useCallback(async () => {
+    setContractLoading(true)
+    setContractError(null)
+    try {
+      const g = await getGlobalState()
+      setContractGlobal(g)
+    } catch (e) {
+      setContractError(e.message ?? 'Failed to load chain state')
+    } finally {
+      setContractLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'blockchain') loadGlobal()
+  }, [tab, loadGlobal])
+
+  const lookupStudent = async () => {
+    if (!studentTarget.trim()) return
+    try {
+      const s = await getStudentState(studentTarget.trim())
+      setStudentState(s)
+    } catch { setStudentState(null) }
+  }
+
+  const runContractOp = async (label, fn) => {
+    const authAddr = loadAddress()
+    if (!authAddr) { setContractError('Connect your wallet (◎ Wallet) first.'); return }
+    setContractAction(label)
+    setContractError(null)
+    setContractTx(null)
+    try {
+      const signer = makePeraSigner(authAddr)
+      const { txID } = await fn(authAddr, signer)
+      setContractTx(txID)
+      await loadGlobal()
+      if (studentTarget) {
+        const s = await getStudentState(studentTarget.trim())
+        setStudentState(s)
+      }
+    } catch (e) {
+      setContractError(
+        e?.message?.includes('rejected')
+          ? 'Transaction rejected in Pera Wallet.'
+          : (e?.message ?? 'Transaction failed')
+      )
+    } finally {
+      setContractAction(null)
+    }
+  }
   const navigate = useNavigate()
+
+  // ── Session: read logged-in gov org ────────────────────────────────
+  const govOrg = (() => { try { return JSON.parse(sessionStorage.getItem('gov_org') || 'null') } catch { return null } })()
+  useEffect(() => { if (!govOrg) navigate('/') }, [])
+  const orgName   = govOrg?.orgName  || 'Officer'
+  const orgScheme = govOrg?.scheme   || ''
+  const orgId     = govOrg?.orgId    || ''
+
+  const handleLogout = () => { sessionStorage.removeItem('gov_org'); navigate('/') }
 
   const filteredSchemes = SCHEMES.filter(s =>
     !schemeFilter || s.name.toLowerCase().includes(schemeFilter.toLowerCase())
@@ -106,19 +184,19 @@ export default function GovDashboard() {
         <div className="dash-topbar">
           <div className="topbar-left">
             <button className="sidebar-toggle" onClick={() => setSidebarOpen(o => !o)}>☰</button>
-            <span className="topbar-title">ExpressScheme — Gov Panel</span>
+            <span className="topbar-title">Gov Control Panel</span>
           </div>
           <div className="topbar-right">
             <div className="topbar-search">
               <input type="text" placeholder="Search schemes, students…" />
             </div>
             <div className="topbar-chain"><span className="chain-dot"></span>Chain: Active</div>
-            <button
-              onClick={() => navigate('/wallet')}
-              style={{ background:'rgba(0,232,198,.12)', color:'var(--accent)', border:'1px solid rgba(0,232,198,.3)', borderRadius:'7px', padding:'.38rem .85rem', fontSize:'.82rem', fontWeight:600, cursor:'pointer', display:'flex', alignItems:'center', gap:'.35rem', whiteSpace:'nowrap' }}
-            >
-              ◎ Wallet
-            </button>
+            <button onClick={() => navigate('/wallet')} style={{ background:'rgba(0,232,198,.12)', color:'var(--accent)', border:'1px solid rgba(0,232,198,.3)', borderRadius:'7px', padding:'.38rem .85rem', fontSize:'.82rem', fontWeight:600, cursor:'pointer', display:'flex', alignItems:'center', gap:'.35rem', whiteSpace:'nowrap' }}>◎ Wallet</button>
+            <div className="topbar-user">
+              <span className="topbar-avatar" style={{background:'rgba(0,232,198,.18)',color:'#00e8c6'}}>{orgName.charAt(0).toUpperCase()}</span>
+              <span className="topbar-uname">{orgName.length > 18 ? orgName.slice(0,18)+'…' : orgName}</span>
+            </div>
+            <button onClick={handleLogout} className="btn-logout">Sign Out</button>
             <ThemeToggle />
           </div>
         </div>
@@ -128,19 +206,22 @@ export default function GovDashboard() {
           <div className="tab-content active">
             <div className="dash-welcome">
               <div>
-                <h1>Good Morning, Officer 👋</h1>
-                <p>Here's the live state of all active scholarship schemes.</p>
+                <h1>Welcome, {orgName} 👋</h1>
+                <p>{orgScheme ? orgScheme + ' · ' : ''}Live status across all active scholarship schemes — FY 2025-26.</p>
               </div>
-              <span className="welcome-date">Feb 19, 2026</span>
+              <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:'.3rem'}}>
+                <span className="welcome-date">{new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</span>
+                {orgId && <span className="topbar-badge" style={{fontSize:'.72rem',fontFamily:'monospace'}}>{orgId}</span>}
+              </div>
             </div>
             <div className="kpi-grid">
               {[
-                { label:'Active Schemes', val:'6', trend:'↑ 2 this month', cls:'kpi-accent', icon:'🏛️' },
-                { label:'Total Budget', val:'₹220 Cr', trend:'Locked on-chain', cls:'', icon:'💰' },
-                { label:'Tokens Minted', val:'11,000', trend:'↑ 5% vs last month', cls:'', icon:'🔗' },
-                { label:'Applications', val:'1,240', trend:'↑ 180 this week', cls:'', icon:'📝' },
-                { label:'AI Flags', val:'7', trend:'3 critical pending', cls:'kpi-warn', icon:'🚨' },
-                { label:'Distributed', val:'₹84 Cr', trend:'73% utilised', cls:'', icon:'💸' },
+                { label:'Active Schemes',  val:'7',          trend:'↑ 3 added this quarter', cls:'kpi-accent', icon:'🏛️' },
+                { label:'Total Budget',    val:'₹601 Cr',    trend:'Union Budget 2026 allocation', cls:'', icon:'💰' },
+                { label:'Tokens Minted',  val:'26,700',      trend:'₹17.5 Cr tokenised on-chain', cls:'', icon:'🔗' },
+                { label:'Applications',   val:'3,841',       trend:'↑ 312 in last 7 days', cls:'', icon:'📝' },
+                { label:'AI Flags',       val:'6',           trend:'3 critical · 3 warning', cls:'kpi-warn', icon:'🚨' },
+                { label:'Distributed',    val:'₹17.5 Cr',    trend:'68.1% AI pass rate', cls:'', icon:'💸' },
               ].map(k => (
                 <div key={k.label} className={`kpi-card${k.cls?' '+k.cls:''}`}>
                   <div className="kpi-top">
@@ -154,7 +235,7 @@ export default function GovDashboard() {
             </div>
             <div className="charts-row">
               <div className="chart-card">
-                <span className="chart-title">Monthly Token Distribution (₹ Cr)</span>
+                <span className="chart-title">Monthly Token Distribution (₹ Cr) · Aug 2025 – Feb 2026</span>
                 <BarChart />
               </div>
               <div className="chart-card" style={{ display:'flex', flexDirection:'column', alignItems:'center' }}>
@@ -168,14 +249,16 @@ export default function GovDashboard() {
                   <span className="chart-title" style={{ margin:0 }}>Recent Transactions</span>
                 </div>
                 <table className="dash-table">
-                  <thead><tr><th>TX Hash</th><th>Scheme</th><th>Amount</th><th>Status</th></tr></thead>
+                  <thead><tr><th>TX Hash</th><th>Scheme</th><th>Amount</th><th>Tokens</th><th>Status</th><th>Block</th></tr></thead>
                   <tbody>
                     {TX_DATA.map(tx => (
                       <tr key={tx.hash}>
-                        <td className="tx-hash">{tx.hash}</td>
+                        <td className="tx-hash" title={tx.fullHash}>{tx.hash}</td>
                         <td>{tx.scheme}</td>
                         <td>{tx.amount}</td>
+                        <td style={{fontVariantNumeric:'tabular-nums'}}>{tx.tokens ? tx.tokens.toLocaleString() : '—'}</td>
                         <td><StatusBadge status={tx.status} /></td>
+                        <td style={{fontSize:'.72rem',color:'var(--text-3)'}}>{tx.block ? tx.block.toLocaleString() : 'Pending'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -236,7 +319,8 @@ export default function GovDashboard() {
                   </div>
                   <p className="sc-body">{s.criteria}</p>
                   <div className="sc-meta">
-                    <span>💰 ₹{s.amount.toLocaleString()}</span>
+                    <span>🏛️ {s.ministry || s.cat}</span>
+                    <span>💰 ₹{s.amount.toLocaleString()}/student</span>
                     <span>👥 {s.benef.toLocaleString()} beneficiaries</span>
                     <span>📅 {s.deadline}</span>
                   </div>
@@ -249,8 +333,8 @@ export default function GovDashboard() {
                     </div>
                     <button
                       className="btn-sm btn-approve"
-                      onClick={() => setTab('tokenize')}
-                    >Tokenize →</button>
+                      onClick={() => setTab('blockchain')}
+                    >Manage On-Chain →</button>
                   </div>
                 </div>
               ))}
@@ -259,58 +343,125 @@ export default function GovDashboard() {
         )}
 
         {/* TOKENIZE */}
-        {tab === 'tokenize' && (
+        {tab === 'blockchain' && (
           <div className="tab-content active">
             <div className="tab-header-row">
-              <div><h2>Tokenize Funds</h2><p>Mint scholarship tokens for verified applicants.</p></div>
+              <div>
+                <h2>⛓️ Blockchain Operations</h2>
+                <p>Live contract state · mark milestones · trigger payouts. App ID: <strong>{APP_ID}</strong></p>
+              </div>
+              <button className="btn-sm btn-view" onClick={loadGlobal} disabled={contractLoading}>
+                {contractLoading ? '↻ Loading…' : '↻ Refresh State'}
+              </button>
             </div>
+
+            {contractTx && (
+              <div style={{ background:'rgba(16,185,129,.1)', border:'1px solid rgba(16,185,129,.3)', borderRadius:'10px', padding:'.75rem 1rem', marginBottom:'1rem', color:'#10b981', fontSize:'.88rem' }}>
+                ✅ Transaction confirmed!&nbsp;&nbsp;
+                <a href={`https://testnet.algoexplorer.io/tx/${contractTx}`} target="_blank" rel="noreferrer" style={{ color:'#10b981', fontWeight:600 }}>View on AlgoExplorer ↗</a>
+              </div>
+            )}
+            {contractError && (
+              <div style={{ background:'rgba(239,68,68,.1)', border:'1px solid rgba(239,68,68,.25)', borderRadius:'10px', padding:'.75rem 1rem', marginBottom:'1rem', color:'#ef4444', fontSize:'.88rem' }}>
+                ❌ {contractError}
+              </div>
+            )}
+
+            {/* Global State */}
+            <div className="table-card" style={{ padding:'1.5rem', marginBottom:'1.25rem' }}>
+              <h3 style={{ marginBottom:'1rem', fontSize:'1rem' }}>📊 Contract Global State</h3>
+              {contractGlobal ? (
+                <>
+                  <div className="kpi-grid" style={{ gridTemplateColumns:'repeat(auto-fill,minmax(160px,1fr))', gap:'.75rem', marginBottom:'1rem' }}>
+                    {[
+                      { label:'Status',         val: contractGlobal.schemeActive ? '🟢 Active' : '🔴 Inactive' },
+                      { label:'Payout/Student', val: contractGlobal.payoutAmount ? (Number(contractGlobal.payoutAmount)/1e6).toFixed(4)+' ALGO' : '—' },
+                      { label:'Spent Budget',   val: contractGlobal.spentBudget  ? (Number(contractGlobal.spentBudget)/1e6).toFixed(4)+' ALGO' : '0 ALGO' },
+                      { label:'Total Budget',   val: contractGlobal.totalBudget  ? (Number(contractGlobal.totalBudget)/1e6).toFixed(4)+' ALGO' : '—' },
+                    ].map(k => (
+                      <div key={k.label} className="kpi-card" style={{ padding:'.9rem 1rem' }}>
+                        <div className="kpi-top"><span className="kpi-label">{k.label}</span></div>
+                        <span className="kpi-val" style={{ fontSize:'1rem' }}>{k.val}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {contractGlobal.authority && (
+                    <div style={{ fontSize:'.8rem', color:'var(--text-2)' }}>
+                      🛡️ Authority: <code style={{ color:'var(--accent)', wordBreak:'break-all' }}>{contractGlobal.authority}</code>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ color:'var(--text-2)', fontSize:'.9rem' }}>Click Refresh to load state from TestNet.</div>
+              )}
+            </div>
+
+            {/* Student Lookup + Actions */}
             <div className="tokenize-layout">
               <div className="tokenize-form-card">
-                <h3>Mint New Batch</h3>
+                <h3>Student Lookup</h3>
                 <div style={{ display:'flex', flexDirection:'column', gap:'1rem' }}>
                   <div className="form-group">
-                    <label>Select Scheme</label>
-                    <select className="filter-select" style={{ width:'100%' }} value={mintScheme} onChange={e => setMintScheme(e.target.value)}>
-                      {SCHEMES.filter(s=>s.status==='active').map(s=><option key={s.id}>{s.name}</option>)}
-                    </select>
+                    <label>Student Wallet Address (Algorand)</label>
+                    <input
+                      className="filter-input"
+                      style={{ fontFamily:'monospace', fontSize:'.83rem' }}
+                      placeholder="ALGO TestNet address…"
+                      value={studentTarget}
+                      onChange={e => setStudentTarget(e.target.value)}
+                    />
                   </div>
-                  <div className="form-group">
-                    <label>Number of Tokens</label>
-                    <input className="filter-input" type="number" value={mintAmount} onChange={e=>setMintAmount(Number(e.target.value))} />
-                  </div>
-                  <div className="form-group">
-                    <label>Lock Until</label>
-                    <input className="filter-input" type="date" defaultValue="2026-12-31" />
-                  </div>
-                  <button className="btn-primary w-full" onClick={() => alert('Tokens minted on-chain!')}>⬡ Mint Tokens</button>
+                  <button className="btn-sm btn-view" onClick={lookupStudent}>🔍 Look Up Student</button>
+                  {studentState === null && studentTarget && (
+                    <div style={{ color:'var(--text-2)', fontSize:'.84rem' }}>Not opted in or not found.</div>
+                  )}
+                  {studentState && (
+                    <div style={{ display:'flex', flexDirection:'column', gap:'.4rem' }}>
+                      {[
+                        { label:'Registered',    ok: studentState.isRegistered },
+                        { label:'Milestone Done', ok: studentState.milestoneCompleted },
+                        { label:'Paid',          ok: studentState.hasBeenPaid },
+                      ].map(s => (
+                        <div key={s.label} style={{ display:'flex', justifyContent:'space-between', fontSize:'.85rem', padding:'.35rem .75rem', background:'var(--bg)', borderRadius:'8px', border:'1px solid var(--border-2)' }}>
+                          <span style={{ color:'var(--text-2)' }}>{s.label}</span>
+                          <span style={{ color: s.ok ? '#10b981' : '#94a3b8', fontWeight:600 }}>{s.ok ? '✔ Yes' : '✗ No'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="tokenize-preview">
-                <h3>Token Preview</h3>
-                <div className="token-preview-card">
-                  <div className="tpc-header">
-                    <span className="tpc-badge">⬡ SCH-TOKEN</span>
-                    <span className="tpc-id">BATCH-2026-LIVE</span>
-                  </div>
-                  <div className="tpc-grid">
-                    <div className="tpc-item"><span className="tpc-l">Scheme</span><span className="tpc-v">{mintScheme.slice(0,24)}…</span></div>
-                    <div className="tpc-item"><span className="tpc-l">Tokens</span><span className="tpc-v accent">{mintAmount.toLocaleString()}</span></div>
-                    <div className="tpc-item"><span className="tpc-l">Value Each</span><span className="tpc-v">₹50,000</span></div>
-                    <div className="tpc-item"><span className="tpc-l">Total Value</span><span className="tpc-v accent">₹{(mintAmount*50000).toLocaleString()}</span></div>
-                  </div>
-                  <div className="tpc-footer">Lock Until: <span>2026-12-31</span></div>
+                <h3>Authority Actions</h3>
+                <p style={{ color:'var(--text-2)', fontSize:'.85rem', marginBottom:'1.2rem', lineHeight:1.6 }}>
+                  Your connected wallet must be the <strong>authority</strong> address stored in the contract.
+                  Connect via <strong>◎ Wallet</strong> before running any action.
+                </p>
+                <div style={{ display:'flex', flexDirection:'column', gap:'.8rem' }}>
+                  <button
+                    className="btn-primary w-full"
+                    disabled={!studentTarget.trim() || !!contractAction}
+                    onClick={() => runContractOp('Marking milestone…', (addr, signer) =>
+                      markMilestoneComplete(addr, studentTarget.trim(), signer)
+                    )}
+                  >
+                    {contractAction === 'Marking milestone…' ? contractAction : '✅ Mark Milestone Complete'}
+                  </button>
+                  <button
+                    className="btn-primary w-full"
+                    disabled={!studentTarget.trim() || !!contractAction}
+                    style={{ background:'rgba(59,130,246,.15)', borderColor:'rgba(59,130,246,.4)', color:'#60a5fa' }}
+                    onClick={() => runContractOp('Releasing payout…', (addr, signer) =>
+                      contractReleasePayout(addr, studentTarget.trim(), signer)
+                    )}
+                  >
+                    {contractAction === 'Releasing payout…' ? contractAction : '💸 Release Payout (Inner Txn)'}
+                  </button>
                 </div>
-                <div className="minted-list">
-                  <h4>Recently Minted</h4>
-                  {MINTED_HISTORY.map(m => (
-                    <div key={m.scheme} className="minted-item">
-                      <span className="mi-scheme">{m.scheme}</span>
-                      <span>{m.tokens.toLocaleString()} tokens</span>
-                      <span className="mi-val">{m.amount}</span>
-                      <span style={{ color:'var(--text-3)', fontSize:'.72rem' }}>{m.time}</span>
-                    </div>
-                  ))}
-                </div>
+                <p style={{ marginTop:'1rem', fontSize:'.78rem', color:'var(--text-3)', lineHeight:1.6 }}>
+                  Payout is sent by the <strong>contract's inner transaction</strong>.
+                  Your wallet sends <strong>0 ALGO directly</strong> — only an App Call.
+                </p>
               </div>
             </div>
           </div>
@@ -337,12 +488,15 @@ export default function GovDashboard() {
               <div key={a.id} className="app-row">
                 <div>
                   <div className="app-name">{a.name}</div>
-                  <div className="app-id">{a.studentId}</div>
+                  <div className="app-id">{a.studentId} · {a.inst}</div>
                 </div>
                 <div className="app-scheme">{a.scheme}</div>
                 <div className="app-amount">₹{a.amount.toLocaleString()}</div>
                 <StatusBadge status={a.status} />
                 <div style={{ fontSize:'.78rem', color:'var(--text-3)' }}>{a.date}</div>
+                <div style={{ fontSize:'.75rem', color:'var(--text-3)', display:'flex', alignItems:'center', gap:'.25rem' }}>
+                  🛡️ {a.aiScore}/100
+                </div>
                 <div className="app-actions">
                   {a.status === 'Pending Review' || a.status === 'AI Verified' ? (
                     <>
@@ -354,6 +508,25 @@ export default function GovDashboard() {
                         className="btn-sm btn-reject"
                         onClick={() => setApps(prev => prev.map(x => x.id===a.id ? {...x,status:'Rejected'} : x))}
                       >✕ Reject</button>
+                    </>
+                  ) : a.status === 'Approved' ? (
+                    <>
+                      <button
+                        className="btn-sm btn-approve"
+                        style={{ background:'rgba(59,130,246,.12)', color:'#60a5fa', borderColor:'rgba(59,130,246,.3)' }}
+                        onClick={() => {
+                          setStudentTarget(a.walletAddress || a.studentId)
+                          setTab('blockchain')
+                        }}
+                      >⛓ Mark Milestone</button>
+                      <button
+                        className="btn-sm btn-approve"
+                        style={{ background:'rgba(16,185,129,.1)', color:'#10b981', borderColor:'rgba(16,185,129,.25)' }}
+                        onClick={() => {
+                          setStudentTarget(a.walletAddress || a.studentId)
+                          setTab('blockchain')
+                        }}
+                      >💸 Payout</button>
                     </>
                   ) : (
                     <button className="btn-sm btn-view">View</button>

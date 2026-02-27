@@ -1,25 +1,33 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Sidebar from '../components/Sidebar'
 import StatusBadge from '../components/StatusBadge'
 import ThemeToggle from '../components/ThemeToggle'
-import { SCHEMES, MY_TOKENS, MY_APPLICATIONS, BRIDGE_BATCH, BRIDGE_RECIPIENTS } from '../data/dashboardData'
+import { SCHEMES, MY_APPLICATIONS } from '../data/dashboardData'
+import {
+  makePeraSigner,
+  optInToApp,
+  registerStudent,
+  getStudentState,
+  isOptedIn,
+  APP_ID,
+} from '../lib/scholarship-contract'
+import { loadAddress } from '../lib/perawallet'
 
 const TABS = [
   { id:'overview',     icon:'📊', label:'My Overview' },
   { id:'browse',       icon:'🔍', label:'Browse Schemes' },
   { id:'applications', icon:'📝', label:'My Applications' },
-  { id:'tokens',       icon:'💎', label:'My Tokens' },
+  { id:'onchain',      icon:'⛓️', label:'On-Chain Status' },
   { id:'verify',       icon:'🤖', label:'AI Verify Me' },
-  { id:'bridge',       icon:'🌉', label:'Bridge Mode' },
 ]
 
 const TIMELINE = [
-  { icon:'✅', title:'Application Submitted', desc:'PM National Scholarship 2026', time:'Feb 16, 2026', state:'done' },
-  { icon:'✅', title:'AI Verification Passed', desc:'Score: 87/100 — All checks passed', time:'Feb 16, 2026', state:'done' },
-  { icon:'✅', title:'Gov Officer Approved', desc:'Approved by Officer OFF-2026-001', time:'Feb 17, 2026', state:'done' },
-  { icon:'⏳', title:'Token Minting in Progress', desc:'Awaiting batch mint confirmation', time:'Pending', state:'pending' },
-  { icon:'⬜', title:'Token Received in Wallet', desc:'Will appear in My Tokens', time:'—', state:'waiting' },
+  { icon:'✅', title:'Application Submitted', desc:'AICTE Pragati Scholarship — APP-2026-000478', time:'Feb 03, 2026', state:'done' },
+  { icon:'✅', title:'AI Verification Passed', desc:'Score: 88/100 — Identity, documents, income all cleared', time:'Feb 03, 2026', state:'done' },
+  { icon:'✅', title:'Gov Officer Approved', desc:'Approved by Sr. Officer Rajiv Sharma (OFF-001)', time:'Feb 06, 2026', state:'done' },
+  { icon:'✅', title:'Token Minted On-Chain', desc:'Asset ID 78812341 · Block 31198432 · Algorand TestNet', time:'Feb 08, 2026', state:'done' },
+  { icon:'⏳', title:'Token Distributed to Wallet', desc:'Awaiting final distribution batch — BATCH-2026-0021', time:'Pending', state:'pending' },
 ]
 
 const AI_STEPS = [
@@ -43,7 +51,7 @@ function TrustGauge({ score = 87 }) {
     ctx.beginPath(); ctx.arc(cx,cy,r,Math.PI,2*Math.PI); ctx.strokeStyle='rgba(255,255,255,.06)'; ctx.lineWidth=12; ctx.stroke()
     const end = Math.PI + (score/100)*Math.PI
     const g = ctx.createLinearGradient(0,0,200,0)
-    g.addColorStop(0,'#EF4444'); g.addColorStop(.5,'#F59E0B'); g.addColorStop(1,'#00E8C6')
+    g.addColorStop(0,'#EF4444'); g.addColorStop(.5,'#FBBF24'); g.addColorStop(1,'#818CF8')
     ctx.beginPath(); ctx.arc(cx,cy,r,Math.PI,end); ctx.strokeStyle=g; ctx.lineWidth=12; ctx.lineCap='round'; ctx.stroke()
   }, [score])
   return (
@@ -60,13 +68,78 @@ export default function UserDashboard() {
   const [tab, setTab] = useState('overview')
   const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth > 1024)
   const [browseFilter, setBrowseFilter] = useState('')
-  const [tokens, setTokens] = useState(MY_TOKENS)
   const [applyModal, setApplyModal] = useState(null)
   const [verifyRunning, setVerifyRunning] = useState(false)
   const [verifyStep, setVerifyStep] = useState(-1)
   const [verifyDone, setVerifyDone] = useState(false)
-  const [distributed, setDistributed] = useState(false)
+
+  // ── Contract state ──────────────────────────────────────
+  const [chainStatus,   setChainStatus]   = useState(null)   // { isRegistered, milestoneCompleted, hasBeenPaid }
+  const [chainOptedIn,  setChainOptedIn]  = useState(false)
+  const [chainLoading,  setChainLoading]  = useState(false)
+  const [chainError,    setChainError]    = useState(null)
+  const [chainTx,       setChainTx]       = useState(null)
+  const [chainAction,   setChainAction]   = useState(null)
+
+  const refreshChainStatus = useCallback(async (addr) => {
+    setChainLoading(true)
+    setChainError(null)
+    try {
+      const opted = await isOptedIn(addr)
+      setChainOptedIn(opted)
+      if (opted) {
+        const s = await getStudentState(addr)
+        setChainStatus(s)
+      } else {
+        setChainStatus(null)
+      }
+    } catch (e) {
+      setChainError(e.message ?? 'Failed to load on-chain status')
+    } finally {
+      setChainLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'onchain') {
+      const addr = loadAddress()
+      if (addr) refreshChainStatus(addr)
+      else setChainError('Connect your wallet (◎ Wallet) first.')
+    }
+  }, [tab, refreshChainStatus])
+
+  const runChainAction = async (label, fn) => {
+    const addr = loadAddress()
+    if (!addr) { setChainError('Connect your wallet (◎ Wallet) first.'); return }
+    setChainAction(label)
+    setChainError(null)
+    setChainTx(null)
+    try {
+      const signer = makePeraSigner(addr)
+      const { txID } = await fn(addr, signer)
+      setChainTx(txID)
+      await refreshChainStatus(addr)
+    } catch (e) {
+      setChainError(
+        e?.message?.includes('rejected') ? 'Transaction rejected in Pera Wallet.'
+        : e?.message?.includes('Already opted in') ? 'Already opted in to this app.'
+        : (e?.message ?? 'Transaction failed')
+      )
+    } finally {
+      setChainAction(null)
+    }
+  }
   const navigate = useNavigate()
+
+  // ── Session: read logged-in citizen ───────────────────────────────
+  const citizen = (() => { try { return JSON.parse(sessionStorage.getItem('citizen_user') || 'null') } catch { return null } })()
+  useEffect(() => { if (!citizen) navigate('/') }, [])
+  const citizenName  = citizen?.name  || 'Citizen'
+  const citizenEmp   = citizen?.employment || ''
+  const citizenPhone = citizen?.phone || ''
+  const aadhaarLinked = !!citizen?.aadhaarLast4
+
+  const handleLogout = () => { sessionStorage.removeItem('citizen_user'); navigate('/') }
 
   const filteredSchemes = SCHEMES.filter(s =>
     s.status === 'active' && (!browseFilter || s.name.toLowerCase().includes(browseFilter.toLowerCase()))
@@ -97,16 +170,16 @@ export default function UserDashboard() {
         <div className="dash-topbar">
           <div className="topbar-left">
             <button className="sidebar-toggle" onClick={() => setSidebarOpen(o=>!o)}>☰</button>
-            <span className="topbar-title">Student Portal</span>
+            <span className="topbar-title">Citizen Portal</span>
           </div>
           <div className="topbar-right">
             <div className="verify-status"><span className="chain-dot"></span>AI Verified</div>
-            <button
-              onClick={() => navigate('/wallet')}
-              style={{ background:'rgba(0,232,198,.12)', color:'var(--accent)', border:'1px solid rgba(0,232,198,.3)', borderRadius:'7px', padding:'.38rem .85rem', fontSize:'.82rem', fontWeight:600, cursor:'pointer', display:'flex', alignItems:'center', gap:'.35rem', whiteSpace:'nowrap' }}
-            >
-              ◎ Wallet
-            </button>
+            <button onClick={() => navigate('/wallet')} style={{ background:'rgba(129,140,248,.12)', color:'var(--accent)', border:'1px solid rgba(129,140,248,.3)', borderRadius:'7px', padding:'.38rem .85rem', fontSize:'.82rem', fontWeight:600, cursor:'pointer', display:'flex', alignItems:'center', gap:'.35rem', whiteSpace:'nowrap' }}>◎ Wallet</button>
+            <div className="topbar-user">
+              <span className="topbar-avatar">{citizenName.charAt(0).toUpperCase()}</span>
+              <span className="topbar-uname">{citizenName}</span>
+            </div>
+            <button onClick={handleLogout} className="btn-logout">Sign Out</button>
             <ThemeToggle />
           </div>
         </div>
@@ -116,19 +189,22 @@ export default function UserDashboard() {
           <div className="tab-content active">
             <div className="dash-welcome">
               <div>
-                <h1>Welcome back, Priya 👋</h1>
-                <p>Your scholarship journey at a glance.</p>
+                <h1>Welcome back, {citizenName} 👋</h1>
+                <p>{citizenEmp ? citizenEmp + ' · ' : ''}Scholarship portal active — track applications & on-chain status below.</p>
               </div>
-              <span className="welcome-date">STU-2026-0042</span>
+              <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:'.3rem'}}>
+                <span className="welcome-date">{citizenPhone ? '+91 ' + citizenPhone : 'Citizen'}</span>
+                {aadhaarLinked && <span className="topbar-badge">🔒 Aadhaar Linked</span>}
+              </div>
             </div>
             <div className="kpi-grid">
               {[
-                { label:'Active Applications', val:'3', icon:'📝', cls:'kpi-accent' },
-                { label:'Tokens Received', val:'2', icon:'💎', cls:'' },
-                { label:'Total Scholarship', val:'₹80,000', icon:'💰', cls:'' },
-                { label:'Trust Score', val:'87/100', icon:'🛡️', cls:'kpi-accent' },
-                { label:'Pending Tokens', val:'1', icon:'⏳', cls:'kpi-warn' },
-                { label:'Redeemed', val:'₹0', icon:'✅', cls:'' },
+                { label:'Active Applications', val:'3',         icon:'📝', cls:'kpi-accent' },
+                { label:'Tokens Received',     val:'2',         icon:'💎', cls:'' },
+                { label:'Total Scholarship',   val:'₹62,000',   icon:'💰', cls:'' },
+                { label:'AI Trust Score',      val:'88/100',    icon:'🛡️', cls:'kpi-accent' },
+                { label:'Pending Distribution',val:'1 token',   icon:'⏳', cls:'kpi-warn' },
+                { label:'Amount Redeemable',   val:'₹62,000',   icon:'✅', cls:'' },
               ].map(k => (
                 <div key={k.label} className={`kpi-card${k.cls?' '+k.cls:''}`}>
                   <div className="kpi-top">
@@ -157,13 +233,15 @@ export default function UserDashboard() {
               </div>
               <div className="table-card" style={{ padding:'1.6rem', textAlign:'center' }}>
                 <span className="chart-title">Trust Score</span>
-                <TrustGauge score={87} />
+                <TrustGauge score={88} />
                 <div className="gauge-checks" style={{ marginTop:'1rem' }}>
                   {[
-                    { label:'Identity', val:'Verified', ok:true },
-                    { label:'Documents', val:'Authentic', ok:true },
-                    { label:'Income', val:'Confirmed', ok:true },
+                    { label:'Identity',    val:'Aadhaar Verified', ok:true },
+                    { label:'Documents',  val:'Authentic (OCR 96%)', ok:true },
+                    { label:'Income',     val:'₹4.2L — Confirmed', ok:true },
                     { label:'Duplicates', val:'None Found', ok:true },
+                    { label:'Bank A/C',   val:'HDFC XXXX-4821', ok:true },
+                    { label:'Eligibility',val:'AICTE Accredited ✓', ok:true },
                   ].map(g => (
                     <div key={g.label} className="gc-item">
                       <span className="gc-label">{g.label}</span>
@@ -204,7 +282,9 @@ export default function UserDashboard() {
                   </div>
                   <p className="sc-body">{s.criteria}</p>
                   <div className="sc-meta">
-                    <span>💰 ₹{s.amount.toLocaleString()}</span>
+                    <span>🏛️ {s.ministry || s.cat}</span>
+                    <span>💰 ₹{s.amount.toLocaleString()}/student</span>
+                    <span>👥 {s.benef.toLocaleString()} beneficiaries</span>
                     <span>📅 {s.deadline}</span>
                   </div>
                   <div className="sc-footer">
@@ -247,38 +327,113 @@ export default function UserDashboard() {
         )}
 
         {/* MY TOKENS */}
-        {tab === 'tokens' && (
+        {tab === 'onchain' && (
           <div className="tab-content active">
             <div className="tab-header-row">
-              <div><h2>My Token Wallet</h2><p>Your scholarship tokens.</p></div>
               <div>
-                <span style={{ color:'var(--accent)', fontWeight:700, fontSize:'1.2rem' }}>
-                  Total: ₹{tokens.filter(t=>t.status!=='redeemed').reduce((s,t)=>s+t.amount,0).toLocaleString()}
-                </span>
+                <h2>⛓️ On-Chain Status</h2>
+                <p>Your status on the ScholarshipTreasury smart contract · App ID: <strong>{APP_ID}</strong></p>
               </div>
+              <button
+                className="btn-sm btn-view"
+                onClick={() => { const a = loadAddress(); if (a) refreshChainStatus(a) }}
+                disabled={chainLoading}
+              >
+                {chainLoading ? '↻ Loading…' : '↻ Refresh'}
+              </button>
             </div>
-            <div className="tokens-wallet">
-              {tokens.map(t => (
-                <div key={t.id} className={`token-card ${t.status}`}>
-                  <div className="tc-scheme">{t.scheme}</div>
-                  <div className="tc-amount">₹{t.amount.toLocaleString()}</div>
-                  <div className="tc-id">{t.id}</div>
-                  <div className="tc-meta">
-                    Issued: {t.issued}<br/>
-                    Expires: {t.expires}
+
+            {chainTx && (
+              <div style={{ background:'rgba(16,185,129,.1)', border:'1px solid rgba(16,185,129,.3)', borderRadius:'10px', padding:'.75rem 1rem', marginBottom:'1rem', color:'#10b981', fontSize:'.88rem' }}>
+                ✅ Transaction confirmed!&nbsp;&nbsp;
+                <a href={`https://testnet.algoexplorer.io/tx/${chainTx}`} target="_blank" rel="noreferrer" style={{color:'#10b981',fontWeight:600}}>View on AlgoExplorer ↗</a>
+              </div>
+            )}
+            {chainError && (
+              <div style={{ background:'rgba(239,68,68,.1)', border:'1px solid rgba(239,68,68,.25)', borderRadius:'10px', padding:'.75rem 1rem', marginBottom:'1rem', color:'#ef4444', fontSize:'.88rem' }}>
+                ❌ {chainError}
+              </div>
+            )}
+
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'1.25rem' }}>
+              {/* Status panel */}
+              <div className="table-card" style={{ padding:'1.5rem' }}>
+                <h3 style={{ marginBottom:'1.2rem', fontSize:'1rem' }}>Your Contract Status</h3>
+                {!chainOptedIn ? (
+                  <div style={{ color:'var(--text-2)', fontSize:'.9rem', marginBottom:'1rem' }}>
+                    You have not opted in to this app yet.<br/>Step 1 below to get started.
                   </div>
-                  <StatusBadge status={t.status} />
-                  {t.status === 'redeemable' && (
+                ) : chainStatus ? (
+                  <div style={{ display:'flex', flexDirection:'column', gap:'.6rem', marginBottom:'1.2rem' }}>
+                    {[
+                      { label:'Opted In',        ok: true },
+                      { label:'Registered',       ok: chainStatus.isRegistered },
+                      { label:'Milestone Done',   ok: chainStatus.milestoneCompleted },
+                      { label:'Payout Released',  ok: chainStatus.hasBeenPaid },
+                    ].map(s => (
+                      <div key={s.label} style={{ display:'flex', justifyContent:'space-between', padding:'.5rem .85rem', background:'var(--bg)', borderRadius:'9px', border:'1px solid var(--border-2)' }}>
+                        <span style={{ color:'var(--text-2)', fontSize:'.88rem' }}>{s.label}</span>
+                        <span style={{ color: s.ok ? '#10b981' : '#94a3b8', fontWeight:700, fontSize:'.88rem' }}>{s.ok ? '✔ Yes' : '✗ No'}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {/* How-it-works flow */}
+                {chainStatus?.hasBeenPaid && (
+                  <div style={{ background:'rgba(16,185,129,.08)', border:'1px solid rgba(16,185,129,.25)', borderRadius:'10px', padding:'1rem', textAlign:'center', color:'#10b981', fontWeight:700, fontSize:'.9rem' }}>
+                    🎉 Scholarship payout has been sent to your wallet!
+                  </div>
+                )}
+              </div>
+
+              {/* Action panel */}
+              <div className="table-card" style={{ padding:'1.5rem' }}>
+                <h3 style={{ marginBottom:'1.2rem', fontSize:'1rem' }}>Student Actions</h3>
+                <div style={{ display:'flex', flexDirection:'column', gap:'.85rem' }}>
+
+                  {/* Step 1: Opt in */}
+                  <div>
+                    <div style={{ fontSize:'.78rem', color:'var(--text-2)', marginBottom:'.4rem', letterSpacing:'.04em', textTransform:'uppercase' }}>Step 1 — Opt In to App</div>
                     <button
-                      className="btn-sm btn-approve"
-                      style={{ marginTop:'.8rem', width:'100%' }}
-                      onClick={() => setTokens(prev => prev.map(x => x.id===t.id ? {...x,status:'redeemed'} : x))}
+                      className="btn-primary w-full"
+                      disabled={!!chainAction || chainOptedIn}
+                      onClick={() => runChainAction('Opting in…', (addr, signer) => optInToApp(addr, signer))}
                     >
-                      Redeem to Bank
+                      {chainAction === 'Opting in…' ? chainAction : chainOptedIn ? '✔ Already Opted In' : '🔐 Opt In to ScholarshipTreasury'}
                     </button>
+                  </div>
+
+                  {/* Step 2: Register */}
+                  <div>
+                    <div style={{ fontSize:'.78rem', color:'var(--text-2)', marginBottom:'.4rem', letterSpacing:'.04em', textTransform:'uppercase' }}>Step 2 — Register as Student</div>
+                    <button
+                      className="btn-primary w-full"
+                      disabled={!!chainAction || !chainOptedIn || chainStatus?.isRegistered}
+                      onClick={() => runChainAction('Registering…', (addr, signer) => registerStudent(addr, signer))}
+                    >
+                      {chainAction === 'Registering…' ? chainAction : chainStatus?.isRegistered ? '✔ Already Registered' : '📝 Register Student'}
+                    </button>
+                  </div>
+
+                  {/* Step 3+: waiting for authority */}
+                  {chainOptedIn && chainStatus?.isRegistered && !chainStatus?.milestoneCompleted && (
+                    <div style={{ background:'rgba(245,158,11,.08)', border:'1px solid rgba(245,158,11,.25)', borderRadius:'10px', padding:'.85rem 1rem', color:'#f59e0b', fontSize:'.85rem', lineHeight:1.6 }}>
+                      ⏳ <strong>Awaiting milestone validation</strong><br/>
+                      The authority wallet must call <code>mark_milestone_complete</code> for your address before payout can be released.
+                    </div>
                   )}
+                  {chainStatus?.milestoneCompleted && !chainStatus?.hasBeenPaid && (
+                    <div style={{ background:'rgba(59,130,246,.08)', border:'1px solid rgba(59,130,246,.25)', borderRadius:'10px', padding:'.85rem 1rem', color:'#60a5fa', fontSize:'.85rem', lineHeight:1.6 }}>
+                      ✅ Milestone verified! <strong>Awaiting officer payout call</strong> — <code>release_payout</code> will send ALGO to your wallet via inner transaction.
+                    </div>
+                  )}
+
+                  <p style={{ fontSize:'.78rem', color:'var(--text-3)', lineHeight:1.6, margin:0 }}>
+                    Connect your Algorand wallet via <strong>◎ Wallet</strong> before performing any on-chain action.
+                  </p>
                 </div>
-              ))}
+              </div>
             </div>
           </div>
         )}
@@ -351,61 +506,6 @@ export default function UserDashboard() {
           </div>
         )}
 
-        {/* BRIDGE MODE */}
-        {tab === 'bridge' && (
-          <div className="tab-content active">
-            <div className="tab-header-row">
-              <div><h2>Bridge Mode</h2><p>Collect and distribute tokens as bridge student.</p></div>
-            </div>
-            <div className="bridge-layout">
-              <div className="bridge-info-card">
-                <div className="bi-icon">🌉</div>
-                <h3>Bridge Student Role</h3>
-                <p>
-                  As bridge student, you receive the full token batch and atomically distribute
-                  to all verified recipients in a single on-chain transaction.
-                </p>
-                <br/>
-                <div className="batch-info-grid">
-                  <div className="big-item"><span className="big-l">Batch ID</span><span className="big-v">{BRIDGE_BATCH.batchId}</span></div>
-                  <div className="big-item"><span className="big-l">Scheme</span><span className="big-v" style={{ fontSize:'.75rem' }}>{BRIDGE_BATCH.scheme}</span></div>
-                  <div className="big-item"><span className="big-l">Tokens</span><span className="big-v">{BRIDGE_BATCH.total.toLocaleString()}</span></div>
-                  <div className="big-item"><span className="big-l">Total Value</span><span className="big-v" style={{ color:'var(--accent)' }}>{BRIDGE_BATCH.amount}</span></div>
-                </div>
-              </div>
-              <div className="bridge-panel">
-                <div className="bridge-distribute-card">
-                  <h3>Recipient List</h3>
-                  {BRIDGE_RECIPIENTS.map(r => (
-                    <div key={r.id} className="dist-item">
-                      <div>
-                        <div style={{ fontWeight:600, color:'var(--text)' }}>{r.name}</div>
-                        <div style={{ fontSize:'.72rem', color:'var(--text-3)', fontFamily:'monospace' }}>{r.id}</div>
-                      </div>
-                      <div style={{ color:'var(--accent)', fontWeight:700 }}>₹{r.amount.toLocaleString()}</div>
-                      <span className={`di-status ${r.status}`}>{r.status === 'verified' ? '✓ Verified' : '⏳ Pending'}</span>
-                    </div>
-                  ))}
-                </div>
-                {!distributed ? (
-                  <button
-                    className="btn-primary w-full"
-                    onClick={() => setDistributed(true)}
-                  >
-                    🌉 Distribute All Tokens
-                  </button>
-                ) : (
-                  <div style={{ background:'rgba(16,185,129,.08)', border:'1px solid rgba(16,185,129,.3)', borderRadius:'10px', padding:'1rem', textAlign:'center', color:'var(--success)', fontWeight:700 }}>
-                    ✅ All tokens distributed on-chain!
-                    <div style={{ fontSize:'.75rem', color:'var(--text-3)', fontFamily:'monospace', marginTop:'.5rem' }}>
-                      TX: 0x{Math.random().toString(16).slice(2,18).toUpperCase()}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* APPLY MODAL */}
